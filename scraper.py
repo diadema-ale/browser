@@ -202,11 +202,25 @@ class CorpaxeScraper:
             print(f"\n→ Searching for: {search_term}")
             self.logger.info(f"Starting search for: {search_term}")
             
-            # Wait for the calendar page to load
+            # Wait for the calendar page to fully load (wait for table or content)
             print("→ Waiting for Calendar page to load...")
-            wait = WebDriverWait(self.driver, 10)
-            self.random_wait(1, 2)  # Give page time to fully load
+            wait = WebDriverWait(self.driver, 20)
+            try:
+                wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+                print("  ✓ Page DOM ready")
+            except:
+                print("  ? Page readyState wait timed out")
             
+            # Wait for any loading indicator to disappear
+            for _ in range(10):
+                loading_texts = self.driver.find_elements(By.XPATH, "//*[contains(text(), 'Loading')]")
+                visible_loading = [el for el in loading_texts if el.is_displayed()]
+                if not visible_loading:
+                    break
+                print("  ⏳ Page still loading...")
+                time.sleep(1)
+            
+            self.random_wait(2, 3)
             self.save_screenshot("calendar_page_loaded")
             
             # Look for search input box
@@ -217,8 +231,8 @@ class CorpaxeScraper:
                 "input[placeholder*='search']", 
                 "#search",
                 ".search-input",
-                "input.form-control",  # Common class for inputs
-                "input[type='text']"   # Generic text input
+                "input.form-control",
+                "input[type='text']"
             ]
             
             search_input = None
@@ -227,9 +241,8 @@ class CorpaxeScraper:
                     elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
                     for element in elements:
                         if element.is_displayed() and element.is_enabled():
-                            # Check if it's likely a search box by position (usually at top)
                             location = element.location
-                            if location['y'] < 300:  # Likely in header/top area
+                            if location['y'] < 300:
                                 search_input = element
                                 print(f"  ✓ Found search input using selector: {selector}")
                                 break
@@ -254,7 +267,6 @@ class CorpaxeScraper:
             search_input.clear()
             self.random_wait()
             
-            # Type slowly to simulate human typing
             for char in search_term:
                 search_input.send_keys(char)
                 time.sleep(random.uniform(0.05, 0.15))
@@ -262,109 +274,94 @@ class CorpaxeScraper:
             self.save_screenshot("search_term_typed")
             print("✓ Search term entered")
             
-            # Wait for dropdown suggestions
-            print("→ Waiting for dropdown suggestions...")
-            self.random_wait(1.5, 2.5)  # Give time for suggestions to appear
+            # Wait for dropdown with actual suggestion items (not just the container)
+            print("→ Waiting for dropdown suggestions to load...")
+            suggestion_selector = ".ant-select-dropdown .rc-virtual-list-holder-inner > div"
+            
+            visible_suggestions = []
+            max_wait_attempts = 12
+            for attempt in range(max_wait_attempts):
+                time.sleep(1)
+                try:
+                    suggestions = self.driver.find_elements(By.CSS_SELECTOR, suggestion_selector)
+                    visible_suggestions = []
+                    for suggestion in suggestions:
+                        if suggestion.is_displayed() and suggestion.text and suggestion.text.strip():
+                            visible_suggestions.append({
+                                'element': suggestion,
+                                'text': suggestion.text.strip()
+                            })
+                    if visible_suggestions:
+                        print(f"  ✓ Found {len(visible_suggestions)} suggestions after {attempt + 1}s")
+                        break
+                except:
+                    pass
+                if attempt < max_wait_attempts - 1:
+                    print(f"  ⏳ Waiting for suggestions... ({attempt + 1}/{max_wait_attempts})")
             
             self.save_screenshot("dropdown_suggestions_visible")
             
-            # Look for dropdown suggestions
-            print("→ Looking for first suggestion...")
+            if not visible_suggestions:
+                print("✗ No visible suggestions found after waiting")
+                self.save_screenshot("no_suggestions_found")
+                return False
             
-            # Wait for dropdown to be visible
-            try:
-                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".ant-select-dropdown")))
-                print("  ✓ Dropdown container found")
-            except:
-                print("  ? Dropdown container not found")
+            print(f"  Found {len(visible_suggestions)} suggestions:")
+            for i, sug in enumerate(visible_suggestions):
+                print(f"    {i+1}. {sug['text']}")
             
-            # Get all suggestions
-            print("→ Getting all suggestions...")
-            suggestion_selector = ".ant-select-dropdown .rc-virtual-list-holder-inner > div"
+            # Look for exact match first
+            exact_match = None
+            search_upper = search_term.upper().strip()
             
-            try:
-                suggestions = self.driver.find_elements(By.CSS_SELECTOR, suggestion_selector)
-                visible_suggestions = []
-                
-                for suggestion in suggestions:
-                    if suggestion.is_displayed() and suggestion.text:
-                        visible_suggestions.append({
-                            'element': suggestion,
-                            'text': suggestion.text.strip()
-                        })
-                
-                if not visible_suggestions:
-                    print("✗ No visible suggestions found")
-                    self.save_screenshot("no_suggestions_found")
-                    return False
-                
-                print(f"  ✓ Found {len(visible_suggestions)} suggestions:")
-                for i, sug in enumerate(visible_suggestions):
-                    print(f"    {i+1}. {sug['text']}")
-                
-                # Look for exact match first
-                exact_match = None
-                search_upper = search_term.upper().strip()
-                
-                for sug in visible_suggestions:
-                    # Check if the suggestion starts with our search term
-                    sug_text_upper = sug['text'].upper()
-                    if sug_text_upper.startswith(search_upper + ":") or sug_text_upper == search_upper:
-                        exact_match = sug
-                        print(f"\n  ✓ Found exact match: {sug['text']}")
-                        break
-                
-                # If no exact match, check if we should look for US listing
-                if not exact_match:
-                    # Check if search term doesn't already have a country code
-                    if not any(search_upper.endswith(f" {country}") for country in ["US", "LN", "CN", "JP", "FP", "GR", "MK", "VN"]):
-                        print("\n  ? No country specified, looking for US listing...")
-                        us_search = search_upper + " US"
-                        
-                        for sug in visible_suggestions:
-                            sug_text_upper = sug['text'].upper()
-                            if sug_text_upper.startswith(us_search + ":"):
-                                exact_match = sug
-                                print(f"  ✓ Found US listing: {sug['text']}")
-                                break
-                
-                # If still no match, look for best partial match
-                if not exact_match:
-                    print("\n  ? No exact match found, looking for best partial match...")
-                    best_match = None
+            for sug in visible_suggestions:
+                sug_text_upper = sug['text'].upper()
+                if sug_text_upper.startswith(search_upper + ":") or sug_text_upper == search_upper:
+                    exact_match = sug
+                    print(f"\n  ✓ Found exact match: {sug['text']}")
+                    break
+            
+            if not exact_match:
+                if not any(search_upper.endswith(f" {country}") for country in ["US", "LN", "CN", "JP", "FP", "GR", "MK", "VN"]):
+                    print("\n  ? No country specified, looking for US listing...")
+                    us_search = search_upper + " US"
                     
                     for sug in visible_suggestions:
                         sug_text_upper = sug['text'].upper()
-                        # Check if our search term appears at the start of the suggestion
-                        if sug_text_upper.startswith(search_upper):
-                            best_match = sug
-                            print(f"  ✓ Found partial match: {sug['text']}")
+                        if sug_text_upper.startswith(us_search + ":"):
+                            exact_match = sug
+                            print(f"  ✓ Found US listing: {sug['text']}")
                             break
-                    
-                    if not best_match and visible_suggestions:
-                        # Fall back to first suggestion
-                        best_match = visible_suggestions[0]
-                        print(f"  ! Using first suggestion as fallback: {best_match['text']}")
-                    
-                    selected_suggestion = best_match
-                else:
-                    selected_suggestion = exact_match
+            
+            if not exact_match:
+                print("\n  ? No exact match found, looking for best partial match...")
+                best_match = None
                 
-                if not selected_suggestion:
-                    print("✗ No suitable suggestion found")
-                    self.save_screenshot("no_suitable_suggestion")
-                    return False
+                for sug in visible_suggestions:
+                    sug_text_upper = sug['text'].upper()
+                    if sug_text_upper.startswith(search_upper):
+                        best_match = sug
+                        print(f"  ✓ Found partial match: {sug['text']}")
+                        break
                 
-                # Click the selected suggestion
-                print(f"\n→ Clicking on: {selected_suggestion['text']}")
-                self.random_wait()
-                selected_suggestion['element'].click()
-                print("✓ Suggestion clicked")
+                if not best_match and visible_suggestions:
+                    best_match = visible_suggestions[0]
+                    print(f"  ! Using first suggestion as fallback: {best_match['text']}")
                 
-            except Exception as e:
-                print(f"✗ Error handling suggestions: {str(e)}")
-                self.save_screenshot("suggestion_error")
+                selected_suggestion = best_match
+            else:
+                selected_suggestion = exact_match
+            
+            if not selected_suggestion:
+                print("✗ No suitable suggestion found")
+                self.save_screenshot("no_suitable_suggestion")
                 return False
+            
+            # Click the selected suggestion
+            print(f"\n→ Clicking on: {selected_suggestion['text']}")
+            self.random_wait()
+            selected_suggestion['element'].click()
+            print("✓ Suggestion clicked")
             
             # Wait for page to load
             print("→ Waiting for new page to load...")
