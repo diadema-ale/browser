@@ -25,7 +25,14 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 class CorpaxeScraper:
-    def __init__(self, headless=True, logger=None):
+    # A company's own page, reachable directly once its Corpaxe id is known.
+    # search_on_calendar() arrives here the long way round: a calendar load, a
+    # hunt for the search box, per-character typing and a dropdown poll, all to
+    # pick the suggestion that navigates to this URL. Callers holding the id have
+    # nothing to search for.
+    COMPANY_URL = "https://app.corpaxe.com/Directory/Companies/{company_id}"
+
+    def __init__(self, headless=True, logger=None, quiet=False):
         """Initialize the scraper with Chrome options"""
         self.headless = headless
         self.driver = None
@@ -34,6 +41,10 @@ class CorpaxeScraper:
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.screenshot_counter = 0
         self.logger = logger or logging.getLogger(__name__)
+        # Every step is worth a screenshot when a human is debugging one ticker,
+        # and worth nothing when a batch is archiving hundreds: 12 shots a run at
+        # ~240KB each is what took runs/ to 267MB for 286 useful images.
+        self.quiet = quiet
         
     def setup_driver(self):
         """Set up Chrome driver with appropriate options"""
@@ -69,8 +80,15 @@ class CorpaxeScraper:
             self.logger.error(f"Failed to initialize Chrome driver: {str(e)}")
             return False
     
-    def save_screenshot(self, name):
-        """Save a screenshot with a descriptive name"""
+    def save_screenshot(self, name, step=True):
+        """Save a screenshot with a descriptive name.
+
+        `step` marks the play-by-play shots, which a quiet run skips. Failure
+        shots pass step=False so a batch still leaves evidence of what broke.
+        """
+        if step and self.quiet:
+            return None
+
         self.screenshot_counter += 1
         filename = f"{self.screenshot_counter:02d}_{name}.png"
         filepath = self.screenshot_dir / filename
@@ -78,6 +96,57 @@ class CorpaxeScraper:
         print(f"  📸 Screenshot saved: {filepath}")
         self.logger.debug(f"Screenshot saved: {filepath}")
         return filepath
+
+    def wait_for_company_page(self, timeout=20):
+        """Wait for the profile panels, not just the app shell.
+
+        readyState goes complete while the page is still an empty frame, so a
+        screenshot taken on that signal alone catches a blank layout. These
+        headings are rendered with the data we are here to photograph.
+        """
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            print("  ? readyState wait timed out")
+
+        markers = ("Upcoming Events", "Past Events", "Corporate Events")
+        for _ in range(timeout):
+            try:
+                if any(marker in self.driver.page_source for marker in markers):
+                    return True
+            except Exception:
+                pass
+            time.sleep(1)
+
+        return False
+
+    def capture_company(self, company_id, settle=2.0):
+        """Screenshot one company's page. Returns an absolute path, or None."""
+        url = self.COMPANY_URL.format(company_id=company_id)
+
+        try:
+            print(f"\n→ Company {company_id}: {url}")
+            self.logger.info(f"Capturing company {company_id}")
+            self.driver.get(url)
+
+            if not self.wait_for_company_page():
+                print(f"✗ Company {company_id}: page never rendered its panels")
+                self.logger.error(f"Company {company_id}: panels never rendered")
+                self.save_screenshot(f"company_{company_id}_incomplete", step=False)
+                return None
+
+            # The panels arrive before the map tiles and the event rows settle.
+            time.sleep(settle)
+
+            filepath = self.save_screenshot(f"company_{company_id}", step=False)
+            return str(filepath.absolute()) if filepath else None
+
+        except Exception as e:
+            print(f"✗ Company {company_id}: {str(e)}")
+            self.logger.error(f"Company {company_id} failed: {str(e)}")
+            return None
     
     def random_wait(self, min_seconds=0.25, max_seconds=1.5):
         """Wait for a random time between min and max seconds"""
@@ -421,69 +490,112 @@ def setup_logging(search_term):
     return logging.getLogger(__name__)
 
 
+def parse_args(argv):
+    """`--companies 1,2,3` takes the batch path; anything else is a search term.
+
+    Deliberately not argparse: the search term is a ticker with a space in it
+    ("ABBV US") that callers pass as separate words, and the existing contract is
+    that everything on the command line joins into one term.
+    """
+    if argv and argv[0] == "--companies":
+        raw = " ".join(argv[1:]).replace(",", " ")
+        return {"mode": "companies", "company_ids": [p for p in raw.split() if p]}
+
+    return {"mode": "search", "search_term": " ".join(argv) if argv else "ABBV US"}
+
+
+def run_batch(scraper, company_ids):
+    """Capture each company on one login. Returns how many succeeded."""
+    captured = 0
+
+    for company_id in company_ids:
+        path = scraper.capture_company(company_id)
+
+        if path:
+            # One line per company so a partial batch is still usable; the caller
+            # maps ids back to its own tickers.
+            print(f"SCREENSHOT={company_id} {path}")
+            captured += 1
+        else:
+            print(f"FAILED={company_id}")
+
+    return captured
+
+
 def main():
     """Main function to run the scraper"""
     # Configuration
     URL = "https://app.corpaxe.com/Account/Login"
     USERNAME = "ale@diademapartnerslp.com"
     PASSWORD = "Copyright2024!"
-    
-    # Default search term or get from command line
-    if len(sys.argv) > 1:
-        SEARCH_TERM = " ".join(sys.argv[1:])
-    else:
-        SEARCH_TERM = "ABBV US"  # Default search term
-    
+
+    args = parse_args(sys.argv[1:])
+    batch = args["mode"] == "companies"
+    label = "batch of %d" % len(args["company_ids"]) if batch else args["search_term"]
+
     # Set up logging
-    logger = setup_logging(SEARCH_TERM)
-    
+    logger = setup_logging(label)
+
     logger.info("=== Corpaxe Login Scraper ===")
-    logger.info(f"Search term: {SEARCH_TERM}\n")
-    
-    # Create scraper instance
-    scraper = CorpaxeScraper(headless=True, logger=logger)
-    
+    logger.info(f"Request: {label}\n")
+
+    # Create scraper instance. A batch logs in once and then navigates straight
+    # to each company, which is the whole point of it: the login is ~11s of a
+    # ~25s single-ticker run, and a batch pays it once rather than per name.
+    scraper = CorpaxeScraper(headless=True, logger=logger, quiet=batch)
+
     # Setup driver
     if not scraper.setup_driver():
         logger.error("Failed to setup Chrome driver")
         sys.exit(1)
-    
+
     exit_code = 1  # Default to failure
-    
+
     try:
         # Attempt login
         success = scraper.login(URL, USERNAME, PASSWORD)
-        
+
         if success:
             print("\n✓ Login completed successfully!")
-            
-            # Perform search on calendar page
-            search_success = scraper.search_on_calendar(SEARCH_TERM)
-            
-            if search_success:
-                print("\n✓ Search completed successfully!")
-                exit_code = 0  # Success
-                
-                # Get last screenshot path
-                last_screenshot = scraper.get_last_screenshot()
-                if last_screenshot:
-                    print(f"\n=== RESULT ===")
-                    print(f"LAST_SCREENSHOT={last_screenshot}")
-                    logger.info(f"Last screenshot: {last_screenshot}")
+
+            if batch:
+                captured = run_batch(scraper, args["company_ids"])
+                total = len(args["company_ids"])
+                print(f"\n=== RESULT ===")
+                print(f"CAPTURED={captured}/{total}")
+                logger.info(f"Captured {captured} of {total}")
+
+                # Partial batches are reported distinctly so a caller can retry
+                # only the names that failed instead of the whole sweep.
+                exit_code = 0 if captured == total else (2 if captured else 1)
             else:
-                print("\n✗ Search failed!")
+                # Perform search on calendar page
+                search_success = scraper.search_on_calendar(args["search_term"])
+
+                if search_success:
+                    print("\n✓ Search completed successfully!")
+                    exit_code = 0  # Success
+
+                    # Get last screenshot path
+                    last_screenshot = scraper.get_last_screenshot()
+                    if last_screenshot:
+                        print(f"\n=== RESULT ===")
+                        print(f"LAST_SCREENSHOT={last_screenshot}")
+                        logger.info(f"Last screenshot: {last_screenshot}")
+                else:
+                    print("\n✗ Search failed!")
         else:
             print("\n✗ Login failed!")
-            
+
     finally:
         # Always close the browser
         scraper.close()
         print(f"\n📁 All screenshots saved to: {scraper.screenshot_dir}")
         print("✓ Run completed")
-        
+
         logger.info(f"Run completed with exit code: {exit_code}")
         logger.info(f"Screenshots saved to: {scraper.screenshot_dir}")
-        
+
         sys.exit(exit_code)
 
 
